@@ -35,7 +35,7 @@ module JavaBuildpack::Util
     #
     # @param [String] cache_root the filesystem root for downloaded files to be cached in
     def initialize(cache_root = Dir.tmpdir)
-      Dir.mkdir(cache_root) unless File.exists? cache_root
+      FileUtils.mkdir_p(cache_root)
       @cache_root = cache_root
       @logger = JavaBuildpack::Diagnostics::LoggerFactory.get_logger
     end
@@ -76,10 +76,10 @@ module JavaBuildpack::Util
         end
 
         lock_file.flock(File::LOCK_SH)
+      end
 
-        File.open(filenames[:cached], File::RDONLY) do |cached_file|
-          yield cached_file
-        end
+      File.open(filenames[:cached], File::RDONLY) do |cached_file|
+        yield cached_file
       end
     end
 
@@ -95,8 +95,10 @@ module JavaBuildpack::Util
         delete_file filenames[:cached]
         delete_file filenames[:etag]
         delete_file filenames[:last_modified]
-        delete_file filenames[:lock]
+
+        lock_file.flock(File::LOCK_SH)
       end
+      delete_file filenames[:lock]
     end
 
     private
