@@ -62,9 +62,7 @@ module JavaBuildpack::Util
     def get(uri)
       filenames = filenames(uri)
 
-      File.open(filenames[:lock], File::CREAT) do |lock_file|
-        lock_file.flock(File::LOCK_EX)
-
+      with_cache_lock(uri) do
         internet_up, file_downloaded = DownloadCache.internet_available?(filenames, uri, @logger)
 
         unless file_downloaded
@@ -74,8 +72,6 @@ module JavaBuildpack::Util
             download(filenames, uri, internet_up)
           end
         end
-
-        lock_file.flock(File::LOCK_SH)
       end
 
       File.open(filenames[:cached], File::RDONLY) do |cached_file|
@@ -89,14 +85,12 @@ module JavaBuildpack::Util
     # @return [void]
     def evict(uri)
       filenames = filenames(uri)
-      File.open(filenames[:lock], File::CREAT) do |lock_file|
-        lock_file.flock(File::LOCK_EX)
+      with_cache_lock(uri) do
 
         delete_file filenames[:cached]
         delete_file filenames[:etag]
         delete_file filenames[:last_modified]
 
-        lock_file.flock(File::LOCK_SH)
       end
       delete_file filenames[:lock]
     end
@@ -309,6 +303,15 @@ module JavaBuildpack::Util
         response.read_body do |chunk|
           cached_file.write(chunk)
         end
+      end
+    end
+
+    def with_cache_lock(uri)
+      filenames = filenames(uri)
+      File.open(filenames[:lock], File::CREAT) do |lock_file|
+        lock_file.flock(File::LOCK_EX)
+        yield
+        lock_file.flock(File::LOCK_SH)
       end
     end
 
