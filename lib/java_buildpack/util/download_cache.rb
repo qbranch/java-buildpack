@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-require 'fileutils'
 require 'java_buildpack/diagnostics'
 require 'java_buildpack/diagnostics/logger_factory'
 require 'java_buildpack/util'
+require 'java_buildpack/util/file_cache'
 require 'monitor'
 require 'net/http'
 require 'tmpdir'
@@ -35,7 +35,6 @@ module JavaBuildpack::Util
     #
     # @param [String] cache_root the filesystem root for downloaded files to be cached in
     def initialize(cache_root = Dir.tmpdir)
-      FileUtils.mkdir_p(cache_root)
       @cache_root = cache_root
       @logger = JavaBuildpack::Diagnostics::LoggerFactory.get_logger
     end
@@ -60,22 +59,22 @@ module JavaBuildpack::Util
     #                    deleted while it is being used, the cached item can only be accessed as part of a block.
     # @return [void]
     def get(uri)
-      filenames = filenames(uri)
+      file_cache = FileCache.new(@cache_root, uri)
 
-      with_cache_lock(uri) do
-        internet_up, file_downloaded = DownloadCache.internet_available?(filenames, uri, @logger)
+      file_cache.lock do |locked_file_cache|
+        internet_up, file_downloaded = DownloadCache.internet_available?(locked_file_cache, uri, @logger)
 
         unless file_downloaded
-          if internet_up && should_update(filenames)
-            update(filenames, uri)
-          elsif should_download(filenames)
-            download(filenames, uri, internet_up)
+          if internet_up && locked_file_cache.should_update
+            update(locked_file_cache, uri)
+          elsif locked_file_cache.should_download
+            download(locked_file_cache, uri, internet_up)
           end
         end
       end
 
-      File.open(filenames[:cached], File::RDONLY) do |cached_file|
-        yield cached_file
+      file_cache.data do |file_data|
+        yield file_data
       end
     end
 
@@ -84,15 +83,7 @@ module JavaBuildpack::Util
     # @param [String] uri the URI of the item to remove
     # @return [void]
     def evict(uri)
-      filenames = filenames(uri)
-      with_cache_lock(uri) do
-
-        delete_file filenames[:cached]
-        delete_file filenames[:etag]
-        delete_file filenames[:last_modified]
-
-      end
-      delete_file filenames[:lock]
+      FileCache.new(@cache_root, uri).destroy
     end
 
     private
@@ -138,7 +129,7 @@ module JavaBuildpack::Util
       YAML.load_file(expanded_path)
     end
 
-    def self.internet_available?(filenames, uri, logger)
+    def self.internet_available?(file_cache, uri, logger)
       @@monitor.synchronize do
         return @@internet_up, false if @@internet_checked # rubocop:disable RedundantReturn
       end
@@ -151,7 +142,7 @@ module JavaBuildpack::Util
           opts = { read_timeout: TIMEOUT_SECONDS, connect_timeout: TIMEOUT_SECONDS, open_timeout: TIMEOUT_SECONDS }
           return http_get(uri, INTERNET_DETECTION_RETRY_LIMIT, logger, opts) do |response|
             internet_up = response.code == HTTP_OK
-            write_response(filenames, response) if internet_up
+            write_response(file_cache, response) if internet_up
             return store_internet_availability(internet_up), internet_up # rubocop:disable RedundantReturn
           end
         rescue *HTTP_ERRORS => ex
@@ -201,15 +192,11 @@ module JavaBuildpack::Util
       end
     end
 
-    def delete_file(filename)
-      File.delete filename if File.exists? filename
-    end
-
-    def download(filenames, uri, internet_up)
+    def download(file_cache, uri, internet_up)
       if internet_up
         begin
           DownloadCache.http_get(uri, DOWNLOAD_RETRY_LIMIT, @logger) do |response|
-            DownloadCache.write_response(filenames, response)
+            DownloadCache.write_response(file_cache, response)
           end
         rescue *HTTP_ERRORS => ex
           puts 'FAIL'
@@ -217,29 +204,19 @@ module JavaBuildpack::Util
           raise error_message
         end
       else
-        look_aside(filenames, uri)
+        look_aside(file_cache, uri)
       end
-    end
-
-    def filenames(uri)
-      key = URI.escape(uri, '/')
-      {
-          cached: File.join(@cache_root, "#{key}.cached"),
-          etag: File.join(@cache_root, "#{key}.etag"),
-          last_modified: File.join(@cache_root, "#{key}.last_modified"),
-          lock: File.join(@cache_root, "#{key}.lock")
-      }
     end
 
     # A download has failed, so check the read-only buildpack cache for the file
     # and use the copy there if it exists.
-    def look_aside(filenames, uri)
+    def look_aside(file_cache, uri)
       @logger.debug "Unable to download from #{uri}. Looking in buildpack cache."
       key = URI.escape(uri, '/')
       stashed = File.join(ENV['BUILDPACK_CACHE'], 'java-buildpack', "#{key}.cached")
       @logger.debug { "Looking in buildpack cache for file '#{stashed}'" }
       if File.exist? stashed
-        FileUtils.cp(stashed, filenames[:cached])
+        file_cache.persist_file stashed
         @logger.debug "Using copy of #{uri} from buildpack cache."
       else
         message = "Buildpack cache does not contain #{uri}. Failing the download."
@@ -249,41 +226,22 @@ module JavaBuildpack::Util
       end
     end
 
-    def self.persist_header(response, header, filename)
-      unless response[header].nil?
-        File.open(filename, File::CREAT | File::WRONLY) do |file|
-          file.write(response[header])
-          file.fsync
-        end
-      end
-    end
-
-    def set_header(request, header, filename)
-      if File.exists?(filename)
-        File.open(filename, File::RDONLY) do |file|
-          request[header] = file.read
-        end
-      end
-    end
-
-    def should_download(filenames)
-      !File.exists?(filenames[:cached])
-    end
-
-    def should_update(filenames)
-      File.exists?(filenames[:cached]) && (File.exists?(filenames[:etag]) || File.exists?(filenames[:last_modified]))
-    end
-
-    def update(filenames, uri)
+    def update(file_cache, uri)
       rich_uri = URI(uri)
 
       Net::HTTP.start(rich_uri.host, rich_uri.port, use_ssl: DownloadCache.use_ssl?(rich_uri)) do |http|
         request = Net::HTTP::Get.new(uri)
-        set_header request, 'If-None-Match', filenames[:etag]
-        set_header request, 'If-Modified-Since', filenames[:last_modified]
+
+        file_cache.etag do |etag_content|
+          request['If-None-Match'] = etag_content
+        end
+
+        file_cache.last_modified do |last_modified_content|
+          request['If-Modified-Since'] = last_modified_content
+        end
 
         http.request request do |response|
-          DownloadCache.write_response(filenames, response) unless response.code == '304'
+          DownloadCache.write_response(file_cache, response) unless response.code == '304'
         end
       end
 
@@ -295,23 +253,14 @@ module JavaBuildpack::Util
       uri.scheme == 'https'
     end
 
-    def self.write_response(filenames, response)
-      persist_header response, 'Etag', filenames[:etag]
-      persist_header response, 'Last-Modified', filenames[:last_modified]
+    def self.write_response(file_cache, response)
+      file_cache.persist_etag response['Etag']
+      file_cache.persist_last_modified response['Last-Modified']
 
-      File.open(filenames[:cached], File::CREAT | File::WRONLY) do |cached_file|
+      file_cache.persist_data do |cached_file|
         response.read_body do |chunk|
           cached_file.write(chunk)
         end
-      end
-    end
-
-    def with_cache_lock(uri)
-      filenames = filenames(uri)
-      File.open(filenames[:lock], File::CREAT) do |lock_file|
-        lock_file.flock(File::LOCK_EX)
-        yield
-        lock_file.flock(File::LOCK_SH)
       end
     end
 
