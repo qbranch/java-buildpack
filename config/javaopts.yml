@@ -15,3 +15,4 @@
 
 # Configuration for the +JAVA_OPTS+ framework
 ---
+JAVA_OPTS=-Driak.hosts=riak1.db.bxb.cpgpaas.net
